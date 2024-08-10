@@ -1,4 +1,4 @@
-import std/[net, os, strformat, strutils]
+import std/[net, os, strformat, strutils, options]
 import hexencoding
 
 const BUF_SIZE* = 8192
@@ -49,31 +49,36 @@ proc getSocketPath*(kind: SocketKind): string =
   else:
     fmt"/tmp/hypr/{hyprInstanceSig}/{socketName}"
 
-proc sendRequestAndReadReply(path: string, content: CommandContent): string =
-  ## Send some data to the Hyprland IPC socket(s).
-  ## This function connects to the socket path provided, granted that it is a valid Hyprland IPC server and sends some data to it.
-  ## 
-  ## If successful, this function returns a tuple with the `success` field set to `true`. Otherwise,
-  ## it returns with `success` set to false and the `response` field contains the error provided by the Hyprland instance.
-  let socket = newSocket(AF_UNIX, SOCK_STREAM, IPPROTO_IP)
-  defer: close socket
-
+template doWithSocket(kind: SocketKind, body: untyped) =
+  let path = getSocketPath(kind)
+  let socket {.inject.} = newSocket(AF_UNIX, SOCK_STREAM, IPPROTO_IP)
   try:
     socket.connectUnix(path)
+    body
   except OSError as exc:
     raise newException(
       IPCConnectionError,
       "Could not connect to Hyprland IPC UNIX socket path; is Hyprland running? (" &
         exc.msg & ": " & path & ')',
     )
+  close socket
 
-  socket.send(content.data)
 
-  var response: string
-  var bytesRead = 8192
-  while bytesRead == 8192:
-    bytesRead = socket.recv(response, BUF_SIZE)
-    result.add response
+proc sendRequestAndReadReply(path: string, content: CommandContent): string =
+  ## Send some data to the Hyprland IPC socket(s).
+  ## This function connects to the socket path provided, granted that it is a valid Hyprland IPC server and sends some data to it.
+  ## 
+  ## If successful, this function returns a tuple with the `success` field set to `true`. Otherwise,
+  ## it returns with `success` set to false and the `response` field contains the error provided by the Hyprland instance.
+
+  doWithSocket(kCommand):
+    socket.send(content.data)
+
+    var response: string
+    var bytesRead = BUF_SIZE
+    while bytesRead == BUF_SIZE:
+      bytesRead = socket.recv(response, BUF_SIZE)
+      result.add response
 
 proc writeToSocket*(
   path: string,
@@ -90,6 +95,17 @@ proc sendJsonRequest*(
   let response = sendRequestAndReadReply(path, content)
   # On success Json commands will return json (that starts with the below chars), anything else is an error string
   return (response[0] in {'\"', '{', '['}, response) 
+
+# TODO:Add an API that keeps the socket connected. Current version could miss events and its wasteful to reconnect often.
+proc getPendingEventData*(): seq[string] =
+  doWithSocket(kListener):
+    result.add socket.recvLine() # Wait indefinitely until first event arrives
+    var dataRemaining = true
+    while dataRemaining: # Keep checking for more events and stop when no events arrived for 100 ms
+      try:
+        result.add socket.recvLine(100)
+      except TimeoutError:
+        dataRemaining = false
 
 proc command*(kind: CommandKind, data: string): CommandContent =
   ## Construct a command with  
